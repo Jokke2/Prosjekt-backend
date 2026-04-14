@@ -1,7 +1,7 @@
 import os
 import json
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from anthropic import Anthropic
 from mcp import ClientSession
@@ -11,6 +11,7 @@ load_dotenv()
 
 app = FastAPI()
 anthropic_client = Anthropic(api_key=os.getenv("CLAUDE_API_KEY"))
+BACKEND_KEY = os.getenv("BACKEND_KEY")
 
 MODEL = "claude-haiku-4-5-20251001"
 MET_MCP_URL = "https://webapi.met.no/mcp-server"
@@ -68,7 +69,10 @@ class WeatherResponse(BaseModel):
 
 
 @app.post("/weather")
-async def get_weather(request: WeatherRequest):
+async def get_weather(request: WeatherRequest, x_api_key: str = Header(...)):
+    if x_api_key != BACKEND_KEY:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    
     try:
         tools = await get_tools()
 
