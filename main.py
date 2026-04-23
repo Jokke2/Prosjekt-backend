@@ -174,7 +174,6 @@ async def get_aurora(
         traceback.print_exc()
         raise HTTPException(500, str(e))
 
-
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
