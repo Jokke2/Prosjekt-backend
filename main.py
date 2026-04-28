@@ -1,16 +1,19 @@
 import os
 import json
+import traceback
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
-from anthropic import Anthropic
+# ── ENDRET: AsyncAnthropic ──
+from anthropic import AsyncAnthropic
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
 load_dotenv()
 
 app = FastAPI()
-anthropic_client = Anthropic(api_key=os.getenv("CLAUDE_API_KEY"))
+# ── ENDRET: async klient ──
+anthropic_client = AsyncAnthropic(api_key=os.getenv("CLAUDE_API_KEY"))
 BACKEND_KEY = os.getenv("BACKEND_KEY")
 
 MODEL = "claude-haiku-4-5-20251001"
@@ -53,6 +56,39 @@ def trim_weather_data(raw_text: str) -> str:
         return raw_text
     except (json.JSONDecodeError, AttributeError):
         return raw_text[:500]
+
+
+# ── NYTT: robust JSON-parsing som håndterer markdown og tomme svar ──
+def extract_json(text: str) -> dict:
+    """Forsøker å parse JSON fra Claude-svar, håndterer markdown og edge cases."""
+    text = text.strip()
+
+    # Fjern markdown code blocks
+    if "```" in text:
+        # Finn innholdet mellom første og siste ```
+        parts = text.split("```")
+        for part in parts:
+            cleaned = part.strip()
+            # Fjern eventuell "json" språk-tag
+            if cleaned.startswith("json"):
+                cleaned = cleaned[4:].strip()
+            if cleaned.startswith("{"):
+                try:
+                    return json.loads(cleaned)
+                except json.JSONDecodeError:
+                    continue
+
+    # Forsøk direkte parsing
+    if text.startswith("{"):
+        return json.loads(text)
+
+    # Forsøk å finne JSON-objekt inne i teksten
+    start = text.find("{")
+    end = text.rfind("}") + 1
+    if start != -1 and end > start:
+        return json.loads(text[start:end])
+
+    raise ValueError(f"Kunne ikke finne JSON i svar: {text[:200]}")
 
 
 class AuroraRequest(BaseModel):
@@ -105,10 +141,15 @@ async def get_aurora(
 
                 messages = [{"role": "user", "content": user_message}]
 
-                while True:
-                    response = anthropic_client.messages.create(
+                # ── ENDRET: maks 10 tool-loops for å unngå uendelig loop ──
+                max_iterations = 10
+
+                for i in range(max_iterations):
+                    # ── ENDRET: await pga AsyncAnthropic ──
+                    response = await anthropic_client.messages.create(
                         model=MODEL,
-                        max_tokens=300,
+                        # ── ENDRET: økt fra 300 til 1024 for å unngå avkuttet svar ──
+                        max_tokens=1024,
                         tools=tools,
                         messages=messages,
                     )
@@ -143,21 +184,38 @@ async def get_aurora(
                         })
 
                     else:
+                        # ── ENDRET: samle tekst fra alle blokker ──
                         final_text = ""
                         for block in response.content:
                             if hasattr(block, "text"):
                                 final_text += block.text
 
-                        final_text = final_text.strip()
-                        if final_text.startswith("```"):
-                            lines = final_text.split("\n")
-                            lines = [
-                                l for l in lines
-                                if not l.strip().startswith("```")
-                            ]
-                            final_text = "\n".join(lines)
+                        # ── NYTT: logg hva Claude faktisk svarte ──
+                        print(f"[DEBUG] Claude raw response: '{final_text[:500]}'")
+                        print(f"[DEBUG] Stop reason: {response.stop_reason}")
 
-                        data = json.loads(final_text)
+                        # ── NYTT: håndter tomt svar ──
+                        if not final_text.strip():
+                            print("[WARN] Claude returnerte tomt svar, ber om JSON på nytt")
+                            messages.append({
+                                "role": "assistant",
+                                "content": response.content,
+                            })
+                            messages.append({
+                                "role": "user",
+                                "content": (
+                                    "You didn't return any text. "
+                                    "Please respond with ONLY the JSON object, nothing else:\n"
+                                    '{"cloud_cover_percent": N, '
+                                    '"aurora_probability_percent": N, '
+                                    '"description": "..."}'
+                                ),
+                            })
+                            # Fortsett loopen for å prøve igjen
+                            continue
+
+                        # ── ENDRET: bruk robust JSON-parser ──
+                        data = extract_json(final_text)
 
                         return AuroraResponse(
                             cloud_cover_percent=int(
@@ -169,10 +227,18 @@ async def get_aurora(
                             description=data["description"],
                         )
 
+                # ── NYTT: hvis vi brukte alle iterasjoner uten svar ──
+                raise HTTPException(
+                    500,
+                    "Claude klarte ikke returnere gyldig JSON etter maks forsøk"
+                )
+
+    except HTTPException:
+        raise
     except Exception as e:
-        import traceback
         traceback.print_exc()
-        raise HTTPException(500, str(e))
+        raise HTTPException(500, f"{type(e).__name__}: {str(e)}")
+
 
 if __name__ == "__main__":
     import uvicorn
