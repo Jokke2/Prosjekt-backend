@@ -7,5 +7,6 @@ PÅ møte:
 
 5. Legg til om det er sol/mørkt.
 6. Legg til forslag på andre steder i nærheten som har mindre skydekke hvis det er mye skydekke
+7. Error 259, anthropic er overloaded. Men håndter feilen.
 
 FOR DEPLOYMENT: Vi kan bruke render.com for å deploye

@@ -1,28 +1,28 @@
 import os
 import json
-import traceback
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
-# ── ENDRET: AsyncAnthropic ──
-from anthropic import AsyncAnthropic
+from anthropic import Anthropic, AsyncAnthropic  # ── NYTT: AsyncAnthropic for /aurora ──
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
 load_dotenv()
 
 app = FastAPI()
-# ── ENDRET: async klient ──
-anthropic_client = AsyncAnthropic(api_key=os.getenv("CLAUDE_API_KEY"))
+anthropic_client = Anthropic(api_key=os.getenv("CLAUDE_API_KEY"))
+async_anthropic_client = AsyncAnthropic(api_key=os.getenv("CLAUDE_API_KEY"))  # ── NYTT: async klient for /aurora ──
 BACKEND_KEY = os.getenv("BACKEND_KEY")
 
 MODEL = "claude-haiku-4-5-20251001"
 MET_MCP_URL = "https://webapi.met.no/mcp-server"
 
+# Cached tools — hentes én gang
 cached_tools = None
 
 
 async def get_tools():
+    """Hent verktøy fra MET — bare første gang, deretter fra cache"""
     global cached_tools
     if cached_tools is not None:
         return cached_tools
@@ -43,6 +43,7 @@ async def get_tools():
 
 
 def trim_weather_data(raw_text: str) -> str:
+    """Behold bare første tidspunkt fra MET-data for å spare tokens"""
     try:
         data = json.loads(raw_text)
         forecast_text = data.get("forecast", raw_text)
@@ -58,18 +59,13 @@ def trim_weather_data(raw_text: str) -> str:
         return raw_text[:500]
 
 
-# ── NYTT: robust JSON-parsing som håndterer markdown og tomme svar ──
+# ── NYTT: robust JSON-parser for /aurora ──
 def extract_json(text: str) -> dict:
-    """Forsøker å parse JSON fra Claude-svar, håndterer markdown og edge cases."""
     text = text.strip()
-
-    # Fjern markdown code blocks
     if "```" in text:
-        # Finn innholdet mellom første og siste ```
         parts = text.split("```")
         for part in parts:
             cleaned = part.strip()
-            # Fjern eventuell "json" språk-tag
             if cleaned.startswith("json"):
                 cleaned = cleaned[4:].strip()
             if cleaned.startswith("{"):
@@ -77,19 +73,111 @@ def extract_json(text: str) -> dict:
                     return json.loads(cleaned)
                 except json.JSONDecodeError:
                     continue
-
-    # Forsøk direkte parsing
     if text.startswith("{"):
         return json.loads(text)
-
-    # Forsøk å finne JSON-objekt inne i teksten
     start = text.find("{")
     end = text.rfind("}") + 1
     if start != -1 and end > start:
         return json.loads(text[start:end])
-
     raise ValueError(f"Kunne ikke finne JSON i svar: {text[:200]}")
 
+
+# ════════════════════════════════════════════
+# /weather — ORIGINALT ENDEPUNKT, UENDRET
+# ════════════════════════════════════════════
+
+class WeatherRequest(BaseModel):
+    latitude: float
+    longitude: float
+
+
+class WeatherResponse(BaseModel):
+    cloud_cover_percent: int
+    description: str
+
+
+@app.post("/weather")
+async def get_weather(request: WeatherRequest, x_api_key: str = Header(...)):
+    if x_api_key != BACKEND_KEY:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    try:
+        tools = await get_tools()
+
+        async with streamable_http_client(MET_MCP_URL) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+
+                user_message = (
+                    f"Cloud cover at {request.latitude},{request.longitude}? "
+                    f'JSON only: {{"cloud_cover_percent":N,"description":"X"}}'
+                )
+
+                messages = [{"role": "user", "content": user_message}]
+
+                while True:
+                    response = anthropic_client.messages.create(
+                        model=MODEL,
+                        max_tokens=100,
+                        tools=tools,
+                        messages=messages,
+                    )
+
+                    if response.stop_reason == "tool_use":
+                        tool_results = []
+
+                        for block in response.content:
+                            if block.type == "tool_use":
+                                result = await session.call_tool(
+                                    block.name,
+                                    arguments=block.input,
+                                )
+
+                                trimmed_text = trim_weather_data(result.content[0].text)
+
+                                tool_results.append({
+                                    "type": "tool_result",
+                                    "tool_use_id": block.id,
+                                    "content": trimmed_text,
+                                })
+
+                        messages.append({
+                            "role": "assistant",
+                            "content": response.content,
+                        })
+                        messages.append({
+                            "role": "user",
+                            "content": tool_results,
+                        })
+
+                    else:
+                        final_text = ""
+                        for block in response.content:
+                            if hasattr(block, "text"):
+                                final_text += block.text
+
+                        final_text = final_text.strip()
+                        if final_text.startswith("```"):
+                            lines = final_text.split("\n")
+                            lines = [l for l in lines if not l.strip().startswith("```")]
+                            final_text = "\n".join(lines)
+
+                        weather_data = json.loads(final_text)
+
+                        return WeatherResponse(
+                            cloud_cover_percent=int(weather_data["cloud_cover_percent"]),
+                            description=weather_data["description"],
+                        )
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
+
+
+# ════════════════════════════════════════════
+# /aurora — NYTT ENDEPUNKT for AI Summary
+# ════════════════════════════════════════════
 
 class AuroraRequest(BaseModel):
     latitude: float
@@ -99,16 +187,12 @@ class AuroraRequest(BaseModel):
 
 
 class AuroraResponse(BaseModel):
-    cloud_cover_percent: int
     aurora_probability_percent: int
     description: str
 
 
 @app.post("/aurora")
-async def get_aurora(
-    request: AuroraRequest,
-    x_api_key: str = Header(...)
-):
+async def get_aurora(request: AuroraRequest, x_api_key: str = Header(...)):
     if x_api_key != BACKEND_KEY:
         raise HTTPException(status_code=403, detail="Forbidden")
 
@@ -133,22 +217,17 @@ async def get_aurora(
                     f"kp-index, and latitude) to estimate the probability "
                     f"of actually seeing the northern lights.\n\n"
                     f"Respond with JSON only, no markdown:\n"
-                    f'{{"cloud_cover_percent": N, '
-                    f'"aurora_probability_percent": N, '
+                    f'{{"aurora_probability_percent": N, '
                     f'"description": "A short paragraph explaining how '
                     f'you arrived at this probability, considering all factors."}}'
                 )
 
                 messages = [{"role": "user", "content": user_message}]
-
-                # ── ENDRET: maks 10 tool-loops for å unngå uendelig loop ──
                 max_iterations = 10
 
                 for i in range(max_iterations):
-                    # ── ENDRET: await pga AsyncAnthropic ──
-                    response = await anthropic_client.messages.create(
+                    response = await async_anthropic_client.messages.create(
                         model=MODEL,
-                        # ── ENDRET: økt fra 300 til 1024 for å unngå avkuttet svar ──
                         max_tokens=1024,
                         tools=tools,
                         messages=messages,
@@ -163,11 +242,7 @@ async def get_aurora(
                                     block.name,
                                     arguments=block.input,
                                 )
-
-                                trimmed_text = trim_weather_data(
-                                    result.content[0].text
-                                )
-
+                                trimmed_text = trim_weather_data(result.content[0].text)
                                 tool_results.append({
                                     "type": "tool_result",
                                     "tool_use_id": block.id,
@@ -184,19 +259,12 @@ async def get_aurora(
                         })
 
                     else:
-                        # ── ENDRET: samle tekst fra alle blokker ──
                         final_text = ""
                         for block in response.content:
                             if hasattr(block, "text"):
                                 final_text += block.text
 
-                        # ── NYTT: logg hva Claude faktisk svarte ──
-                        print(f"[DEBUG] Claude raw response: '{final_text[:500]}'")
-                        print(f"[DEBUG] Stop reason: {response.stop_reason}")
-
-                        # ── NYTT: håndter tomt svar ──
                         if not final_text.strip():
-                            print("[WARN] Claude returnerte tomt svar, ber om JSON på nytt")
                             messages.append({
                                 "role": "assistant",
                                 "content": response.content,
@@ -205,37 +273,26 @@ async def get_aurora(
                                 "role": "user",
                                 "content": (
                                     "You didn't return any text. "
-                                    "Please respond with ONLY the JSON object, nothing else:\n"
-                                    '{"cloud_cover_percent": N, '
-                                    '"aurora_probability_percent": N, '
+                                    "Please respond with ONLY the JSON object:\n"
+                                    '{"aurora_probability_percent": N, '
                                     '"description": "..."}'
                                 ),
                             })
-                            # Fortsett loopen for å prøve igjen
                             continue
 
-                        # ── ENDRET: bruk robust JSON-parser ──
                         data = extract_json(final_text)
 
                         return AuroraResponse(
-                            cloud_cover_percent=int(
-                                data["cloud_cover_percent"]
-                            ),
-                            aurora_probability_percent=int(
-                                data["aurora_probability_percent"]
-                            ),
-                            description=data["description"],
+                            aurora_probability_percent=int(float(data["aurora_probability_percent"])),
+                            description=str(data["description"]),
                         )
 
-                # ── NYTT: hvis vi brukte alle iterasjoner uten svar ──
-                raise HTTPException(
-                    500,
-                    "Claude klarte ikke returnere gyldig JSON etter maks forsøk"
-                )
+                raise HTTPException(500, "Klarte ikke hente gyldig svar etter maks forsøk")
 
     except HTTPException:
         raise
     except Exception as e:
+        import traceback
         traceback.print_exc()
         raise HTTPException(500, f"{type(e).__name__}: {str(e)}")
 
