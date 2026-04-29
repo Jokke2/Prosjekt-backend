@@ -14,7 +14,8 @@ anthropic_client = Anthropic(api_key=os.getenv("CLAUDE_API_KEY"))
 async_anthropic_client = AsyncAnthropic(api_key=os.getenv("CLAUDE_API_KEY"))  # ── NYTT: async klient for /aurora ──
 BACKEND_KEY = os.getenv("BACKEND_KEY")
 
-MODEL = "claude-haiku-4-5-20251001"
+#MODEL = "claude-haiku-4-5-20251001"
+MODEL = "claude-haiku-3-20240307"
 MET_MCP_URL = "https://webapi.met.no/mcp-server"
 
 # Cached tools — hentes én gang
