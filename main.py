@@ -173,12 +173,13 @@ async def get_aurora_summary(request: AuroraSummaryRequest, x_api_key: str = Hea
 
                 user_message = f"""You are an aurora borealis expert. Use your weather tools to check cloud cover and whether it is dark or light outside at coordinates {request.latitude},{request.longitude}.
 
-Then, based on the retrieved conditions plus these inputs:
-- Kp-index: {request.kp_index} (scale 0-9, higher = more active aurora)
-- Aurora probability: {request.aurora_probability:.0f}%
-- Aurora intensity score: {request.aurora_score:.0f}/100 (higher = stronger/more vivid aurora)
+Then write a short, easy-to-read summary with these points:
+- Kp-index: {request.kp_index}/9 — briefly what this means for aurora activity
+- Aurora score: {request.aurora_score:.0f}/100 — briefly what this means for intensity
+- Aurora probability: {request.aurora_probability:.0f}% — how the above factors combine to give this probability
+- Cloud cover and daylight: how current conditions affect visibility
 
-Write a 2-3 sentence friendly explanation of why the aurora probability is {request.aurora_probability:.0f}% right now. Mention the Kp-index, aurora intensity score, cloud cover and whether it is dark or light outside, and how each factor contributes."""
+Keep it to 3-4 short sentences. Be direct and concise. No filler phrases."""
 
                 messages = [{"role": "user", "content": user_message}]
 
